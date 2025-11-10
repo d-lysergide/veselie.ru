@@ -1,0 +1,10 @@
+services:
+  - type: worker
+    name: tg-watermark-bot
+    env: docker
+    autoDeploy: true
+    plan: starter
+    region: frankfurt
+    envVars:
+      - key: BOT_TOKEN
+        sync: false

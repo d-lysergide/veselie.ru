@@ -2,319 +2,300 @@
 import os
 import re
 import math
+import time
 import tempfile
 import subprocess
 from io import BytesIO
 
 import requests
-from PIL import Image
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    ContextTypes, filters, CallbackQueryHandler
 )
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# =========================
-# НАСТРОЙКИ / ПЕРЕМЕННЫЕ
-# =========================
-
+# ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# пути до PNG-водяных знаков (лежат рядом с bot.py)
-WM_VESELIE = "VESELIE_RU_watermark_transparent.png"
-WM_FRIKI   = "FRIKI_REDANA_18_plus_transparent.png"
+# Пути к PNG-водяным знакам (должны лежать рядом с bot.py)
+WATERMARKS = {
+    "ve": ("ВЕСЕЛЬЕ.РУ", "VESELIE_RU_watermark_transparent.png"),
+    "fr": ("ФРИКИ РЕДАНА 18+", "FRIKI_REDANA_18_plus_transparent.png"),
+}
 
-# что выбрано по умолчанию
-DEFAULT_WM = "VESELIE"  # VESELIE | FRIKI
-
-# Лимит Телеграм на скачивание ботом (файлы больше — Telegram не отдаёт file_path)
-TG_MAX_DOWNLOAD_MB = int(os.getenv("TG_MAX_DOWNLOAD_MB", "20"))
-TG_MAX_DOWNLOAD    = TG_MAX_DOWNLOAD_MB * 1024 * 1024
-
-# Ограничения на итоговый файл, чтобы точно отправить обратно
-OUTPUT_MAX_MB = int(os.getenv("OUTPUT_MAX_MB", "45"))     # целим ~45 МБ
-MAX_W         = int(os.getenv("MAX_W", "960"))            # макс. ширина для даунскейла
-
-# «летающая» метка на видео
+# Параметры «летающей» марки для видео
 VIDEO_SCALE_W = 0.70
 WAVE_TX, WAVE_TY = 6.0, 5.0
 WAVE_AMPL_X, WAVE_AMPL_Y = 0.25, 0.25
 
-# Фото: диагонально на весь кадр
-PHOTO_ANGLE_DEG  = 35
+# Параметры диагональной марки для фото
+PHOTO_ANGLE_DEG = 35
 PHOTO_ALPHA_MULT = 1.0
 
-URL_RE = re.compile(r"https?://[^\s]+")
+# Скачивание по URL (лимиты/таймауты)
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB «на всякий», можно уменьшить
+HTTP_TIMEOUT = 30
+CHUNK = 1024 * 1024
+
+# Память выбора марки по чату
+user_choice: dict[int, str] = {}  # chat_id -> key ("ve"/"fr")
+# ==================================================
 
 
-# =========================
-# ВСПОМОГАТЕЛЬНОЕ
-# =========================
-
-def ensure_wm(path: str) -> None:
+# ---------- утилиты водяных знаков ----------
+def ensure_wm_exists(path: str) -> None:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Не найден watermark '{path}' рядом с bot.py")
 
-def pick_wm(name: str) -> str:
-    name = (name or DEFAULT_WM).upper()
-    if name == "FRIKI":
-        ensure_wm(WM_FRIKI);   return WM_FRIKI
-    ensure_wm(WM_VESELIE);     return WM_VESELIE
+def get_wm_path(key: str) -> str:
+    key = key if key in WATERMARKS else "ve"
+    _, fn = WATERMARKS[key]
+    ensure_wm_exists(fn)
+    return fn
 
-def current_wm(context: ContextTypes.DEFAULT_TYPE) -> str:
-    return context.user_data.get("wm", DEFAULT_WM)
 
-def set_wm(context: ContextTypes.DEFAULT_TYPE, name: str) -> None:
-    context.user_data["wm"] = name
-
-def wm_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("ВЕСЕЛЬЕ.РУ", callback_data="wm:VESELIE"),
-         InlineKeyboardButton("ФРИКИ РЕДАНА 18+", callback_data="wm:FRIKI")]
-    ])
-
-def scale_filter_flying(wm_scale=VIDEO_SCALE_W):
-    return (
-        f"[1:v][0:v]scale2ref=w=iw*{wm_scale}:h=ow/mdar[wm][vid];"
+# ---------- ffmpeg обработка ----------
+def ffmpeg_overlay_flying(in_path: str, out_path: str, wm_path: str) -> None:
+    filter_str = (
+        f"[1:v][0:v]scale2ref=w=iw*{VIDEO_SCALE_W}:h=ow/mdar[wm][vid];"
         f"[vid][wm]overlay="
         f"x=(W-w)/2 + (W*{WAVE_AMPL_X})*sin(2*PI*t/{WAVE_TX}):"
         f"y=(H-h)/2 + (H*{WAVE_AMPL_Y})*cos(2*PI*t/{WAVE_TY}):"
         f"format=auto"
     )
-
-def ffprobe_duration(path: str) -> float | None:
-    try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path
-        ], text=True)
-        return float(out.strip())
-    except Exception:
-        return None
-
-def run_ffmpeg(cmd: list[str]) -> None:
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner",
+        "-i", in_path, "-i", wm_path,
+        "-filter_complex", filter_str,
+        "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "copy",
+        out_path
+    ]
     subprocess.run(cmd, check=True)
 
-def compress_video_with_cap(src: str, dst: str, wm_path: str) -> None:
-    """
-    1) Накладываем метку + даунскейлим до MAX_W
-    2) Пробуем CRF 23, если файл > OUTPUT_MAX_MB — CRF 28
-    """
-    temp1 = os.path.join(os.path.dirname(dst), "stage.mp4")
 
-    # Наложение + масштаб по ширине
-    vf = (
-        f"scale='min({MAX_W},iw)':-2:flags=bicubic,"
-        f"format=yuv420p"
-    )
-    filter_complex = f"{scale_filter_flying()},{vf}"
-
-    run_ffmpeg([
-        "ffmpeg","-hide_banner","-loglevel","error","-y",
-        "-i", src, "-i", wm_path,
-        "-filter_complex", filter_complex,
-        "-map","0:a?","-c:v","libx264","-preset","veryfast","-crf","23",
-        "-c:a","aac","-b:a","128k", temp1
-    ])
-
-    # Проверим размер
-    if os.path.getsize(temp1) <= OUTPUT_MAX_MB * 1024 * 1024:
-        os.replace(temp1, dst)
-        return
-
-    # Ещё ужать
-    run_ffmpeg([
-        "ffmpeg","-hide_banner","-loglevel","error","-y",
-        "-i", temp1,
-        "-c:v","libx264","-preset","veryfast","-crf","28",
-        "-c:a","aac","-b:a","96k", dst
-    ])
-
-def overlay_diagonal_photo(photo_bytes: bytes, wm_path: str) -> bytes:
+def pil_overlay_diagonal(photo_bytes: bytes, wm_path: str) -> bytes:
+    ensure_wm_exists(wm_path)
     base = Image.open(BytesIO(photo_bytes)).convert("RGBA")
     W, H = base.size
+
     wm = Image.open(wm_path).convert("RGBA")
-
     if PHOTO_ALPHA_MULT != 1.0:
-        r,g,b,a = wm.split()
+        r, g, b, a = wm.split()
         a = a.point(lambda p: int(p * PHOTO_ALPHA_MULT))
-        wm = Image.merge("RGBA",(r,g,b,a))
+        wm = Image.merge("RGBA", (r, g, b, a))
 
-    # тянем по диагонали
-    diag = int(math.sqrt(W*W + H*H))
+    diag = int(math.sqrt(W * W + H * H))
     scale = diag / wm.width
-    wm = wm.resize((int(wm.width*scale), int(wm.height*scale)), Image.LANCZOS)
+    wm = wm.resize((int(wm.width * scale), int(wm.height * scale)), Image.LANCZOS)
     wm = wm.rotate(PHOTO_ANGLE_DEG, expand=True, resample=Image.BICUBIC)
 
-    x = (W - wm.width)//2
-    y = (H - wm.height)//2
+    x = (W - wm.width) // 2
+    y = (H - wm.height) // 2
 
     out = base.copy()
-    out.alpha_composite(wm, (x,y))
+    out.alpha_composite(wm, (x, y))
     buf = BytesIO()
     out.save(buf, format="PNG")
     buf.seek(0)
     return buf.read()
 
-def download_http_to(path: str, url: str, max_bytes: int | None = None) -> None:
-    with requests.get(url, stream=True, timeout=60) as r:
+
+# ---------- нормализация ссылок ----------
+URL_RE = re.compile(r'(https?://\S+)', re.IGNORECASE)
+
+def normalize_url(url: str) -> str:
+    """Чинит популярные шар-ссылки → прямые скачивания, если возможно."""
+    u = url.strip()
+
+    # Dropbox: https://www.dropbox.com/s/<id>/<name>?dl=0 → dl=1
+    if "dropbox.com" in u:
+        # вариант 1: подменить хост на dl.dropboxusercontent.com
+        u = u.replace("www.dropbox.com", "dl.dropboxusercontent.com")
+        u = re.sub(r"[?&]dl=\d", "", u)
+        return u
+
+    # Google Drive: https://drive.google.com/file/d/<ID>/view?… → прямой usercontent
+    m = re.search(r"drive\.google\.com/file/d/([^/]+)/", u)
+    if m:
+        file_id = m.group(1)
+        # usercontent линк стабильнее для больших файлов
+        return f"https://drive.usercontent.google.com/uc?id={file_id}&export=download"
+
+    # Если уже похоже на прямую ссылку на файл (mp4/mov/m4v/webm)
+    if re.search(r"\.(mp4|mov|m4v|webm)(\?|$)", u, re.IGNORECASE):
+        return u
+
+    # Files.fm, Direct CDN и прочие — оставляем как есть (ffmpeg/requests разберутся)
+    return u
+
+
+def download_url_to_file(url: str, dest_path: str) -> None:
+    """Качаем с нормализованного URL в файл (полностью), с лимитами."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; TelegramWatermarkBot/1.0)"
+    }
+    with requests.get(url, headers=headers, stream=True, timeout=HTTP_TIMEOUT, allow_redirects=True) as r:
         r.raise_for_status()
         total = 0
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(1024*64):
-                if chunk:
-                    f.write(chunk)
-                    total += len(chunk)
-                    if max_bytes and total > max_bytes:
-                        raise RuntimeError("Слишком большой файл по ссылке")
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=CHUNK):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("Слишком большой файл (превысил лимит на сервере).")
+                f.write(chunk)
 
-# =========================
-# ХЕНДЛЕРЫ
-# =========================
 
-async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not current_wm(c):
-        set_wm(c, DEFAULT_WM)
-    await u.message.reply_text(
-        "Отправь видео или фото.\n"
-        "• Большие файлы, из-за которых Телеграм ругается — пришли **ссылкой (http/https)**.\n"
-        "• Кнопками ниже выбери водяной знак.",
-        reply_markup=wm_keyboard()
+# ---------- кнопки выбора водяного знака ----------
+def wm_keyboard(current: str | None = None) -> InlineKeyboardMarkup:
+    buttons = []
+    for key, (title, _) in WATERMARKS.items():
+        txt = f"{'✅ ' if current == key else ''}{title}"
+        buttons.append([InlineKeyboardButton(txt, callback_data=f"wm:{key}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+# =================== handlers ===================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id not in user_choice:
+        user_choice[chat_id] = "ve"
+    await update.message.reply_text(
+        "Отправь видео/фото **или ссылку на видео**.\n\n"
+        "• Видео: большая прозрачная метка по центру «летает».\n"
+        "• Фото: метка диагонально на весь кадр.\n"
+        "• Большие файлы: пришли ссылку — бот сам скачает.\n\n"
+        "Выбери, какой знак ставить:",
+        reply_markup=wm_keyboard(user_choice.get(chat_id))
     )
 
-async def change_wm(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    q = u.callback_query
+
+async def on_wm_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
     await q.answer()
-    if q.data and q.data.startswith("wm:"):
-        name = q.data.split(":",1)[1]
-        set_wm(c, name)
-        await q.edit_message_text(
-            f"Готово. Текущая метка: **{name}**.\nОтправь видео/фото или пришли ссылку.",
-            reply_markup=wm_keyboard(), parse_mode="Markdown"
+    chat_id = q.message.chat.id
+    _, key = q.data.split(":")
+    user_choice[chat_id] = key
+    await q.edit_message_text(
+        f"Ок, выбран: {WATERMARKS[key][0]}.\nТеперь пришли видео/фото или ссылку.",
+    )
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    key = user_choice.get(chat_id, "ve")
+    wm_path = get_wm_path(key)
+
+    photo = update.message.photo[-1] if update.message.photo else None
+    if not photo and update.message.document:
+        if not (update.message.document.mime_type or "").startswith("image"):
+            return await update.message.reply_text("Пришли фото или image-документ.")
+        tgfile = await update.message.document.get_file()
+        raw = await tgfile.download_as_bytearray()
+    else:
+        if not photo:
+            return await update.message.reply_text("Пришли фото.")
+        tgfile = await photo.get_file()
+        raw = await tgfile.download_as_bytearray()
+
+    out_bytes = pil_overlay_diagonal(bytes(raw), wm_path)
+    await update.message.reply_photo(photo=out_bytes, caption="Готово ✅")
+
+
+async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Приём маленьких видео через Telegram (<= ~20 МБ)."""
+    chat_id = update.effective_chat.id
+    key = user_choice.get(chat_id, "ve")
+    wm_path = get_wm_path(key)
+
+    f = update.message.document or update.message.video
+    if not f:
+        return await update.message.reply_text("Пришли видео как файл (Document) или как Video.")
+
+    # Telegram ограничивает скачивание файлов ботом примерно до 20 МБ
+    if getattr(f, "file_size", 0) and f.file_size > 19 * 1024 * 1024:
+        return await update.message.reply_text(
+            "Файл слишком большой для скачивания через Bot API (> ~20 МБ).\n"
+            "Пришли **ссылку** (dropbox/drive/прямая) на это видео — я сам скачаю и обработаю."
         )
 
-def too_big_msg():
-    return (
-        f"Файл слишком большой для скачивания через Bot API (> {TG_MAX_DOWNLOAD_MB} МБ).\n"
-        "Пришли **ссылку (http/https)** на файл — я скачаю напрямую, обработаю и верну результат."
-    )
-
-async def handle_video(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    f = u.message.document or u.message.video
-    if not f:
-        return
-
-    # Ранний чек лимита Telegram
-    if getattr(f, "file_size", 0) > TG_MAX_DOWNLOAD:
-        return await u.message.reply_text(too_big_msg())
-
-    status = await u.message.reply_text("Скачиваю видео…")
-    file = await f.get_file()
-
+    status = await update.message.reply_text("Скачиваю видео…")
+    tgfile = await f.get_file()
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, "in.mp4")
-        out = os.path.join(tmp, "out.mp4")
-        await file.download_to_drive(src)
-        await status.edit_text("Обрабатываю видео…")
+        dst = os.path.join(tmp, "out.mp4")
+        await tgfile.download_to_drive(src)
 
-        wm_path = pick_wm(current_wm(c))
+        await status.edit_text("Обрабатываю видео…")
         try:
-            compress_video_with_cap(src, out, wm_path)
+            ffmpeg_overlay_flying(src, dst, wm_path)
         except subprocess.CalledProcessError:
             return await status.edit_text("Ошибка ffmpeg при обработке.")
         await status.edit_text("Отправляю результат…")
-        await u.message.reply_video(video=out, caption="Готово ✅", supports_streaming=True)
+        await update.message.reply_video(video=dst, caption="Готово ✅", supports_streaming=True)
         await status.delete()
 
-async def handle_photo(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    photo = u.message.photo[-1] if u.message.photo else None
-    doc = u.message.document if (u.message.document and (u.message.document.mime_type or "").startswith("image")) else None
-    if not photo and not doc:
-        return
-    size = getattr(doc, "file_size", 0) if doc else getattr(photo, "file_size", 0)
-    if size > TG_MAX_DOWNLOAD:
-        return await u.message.reply_text(too_big_msg())
 
-    status = await u.message.reply_text("Скачиваю фото…")
-    tgfile = await (doc.get_file() if doc else photo.get_file())
-    raw = await tgfile.download_as_bytearray()
+async def on_text_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Поймать ссылку в тексте, «починить», скачать, обработать."""
+    chat_id = update.effective_chat.id
+    key = user_choice.get(chat_id, "ve")
+    wm_path = get_wm_path(key)
 
-    wm_path = pick_wm(current_wm(c))
-    try:
-        out_bytes = overlay_diagonal_photo(bytes(raw), wm_path)
-    except Exception:
-        return await status.edit_text("Ошибка обработки изображения.")
-    await status.edit_text("Отправляю результат…")
-    await u.message.reply_photo(photo=out_bytes, caption="Готово ✅")
-    await status.delete()
-
-async def handle_url(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Ловим сообщения со ссылкой: качаем напрямую и обрабатываем как видео/фото."""
-    text = u.message.text or ""
+    text = update.message.text or ""
     m = URL_RE.search(text)
     if not m:
-        return
-    url = m.group(0).strip()
+        return  # обычный текст игнорим
 
-    status = await u.message.reply_text("Качаю по ссылке…")
-    with tempfile.TemporaryDirectory() as tmp:
-        # Пробуем понять тип по расширению (очень грубо)
-        low = url.lower()
-        is_image = any(low.endswith(ext) for ext in (".png",".jpg",".jpeg",".webp"))
-        is_video = any(low.endswith(ext) for ext in (".mp4",".mov",".m4v",".webm",".mkv",".avi"))
+    raw_url = m.group(1)
+    url = normalize_url(raw_url)
 
-        try:
-            if is_image:
-                dst = os.path.join(tmp, "img")
-                download_http_to(dst, url, max_bytes=None)
-                wm_path = pick_wm(current_wm(c))
-                with open(dst, "rb") as f:
-                    raw = f.read()
-                out_bytes = overlay_diagonal_photo(raw, wm_path)
-                await status.edit_text("Отправляю результат…")
-                await u.message.reply_photo(photo=out_bytes, caption="Готово ✅")
-                return
-
-            # считаем видео по умолчанию
+    status = await update.message.reply_text("Проверяю ссылку, скачиваю видео…")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in.mp4")
-            out = os.path.join(tmp, "out.mp4")
-            download_http_to(src, url, max_bytes=None)
+            dst = os.path.join(tmp, "out.mp4")
 
+            # скачиваем полностью на диск
+            try:
+                download_url_to_file(url, src)
+            except Exception as e:
+                return await status.edit_text(f"Не смог скачать файл по ссылке:\n{e}")
+
+            # обрабатываем
             await status.edit_text("Обрабатываю видео…")
-            wm_path = pick_wm(current_wm(c))
-            compress_video_with_cap(src, out, wm_path)
+            try:
+                ffmpeg_overlay_flying(src, dst, wm_path)
+            except subprocess.CalledProcessError:
+                return await status.edit_text("Ошибка ffmpeg при обработке.")
 
             await status.edit_text("Отправляю результат…")
-            await u.message.reply_video(video=out, caption="Готово ✅", supports_streaming=True)
+            await update.message.reply_video(video=dst, caption="Готово ✅", supports_streaming=True)
+            await status.delete()
 
-        except requests.HTTPError:
-            await status.edit_text("Не удалось скачать по ссылке (HTTP ошибка).")
-        except RuntimeError as e:
-            await status.edit_text(str(e))
-        except subprocess.CalledProcessError:
-            await status.edit_text("Ошибка ffmpeg при обработке.")
-        except Exception:
-            await status.edit_text("Не удалось обработать файл по ссылке.")
-        finally:
-            try: await status.delete()
-            except: pass
+    except Exception as e:
+        await status.edit_text(f"Ошибка: {e}")
 
-# =========================
-# MAIN
-# =========================
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("Нет BOT_TOKEN.")
+        raise SystemExit("Нет BOT_TOKEN")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(change_wm, pattern=r"^wm:"))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))  # ловим ссылки
+    app.add_handler(CallbackQueryHandler(on_wm_choice, pattern=r"^wm:"))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, on_video))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_url))
+
     print("Бот запущен.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
